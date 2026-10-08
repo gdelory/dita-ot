@@ -505,7 +505,9 @@ public class ChunkModule extends AbstractPipelineModuleImpl {
         try {
           //   recursively merge chunk topics
           final Document chunkDoc = merge(chunk);
-          rewriteLinks(chunkDoc, chunk.src(), rewriteMap);
+          // When src is null (submap-root chunk with no href), use dst as the base URI
+          // so relative links in the merged document are resolved correctly.
+          rewriteLinks(chunkDoc, chunk.src() != null ? chunk.src() : dst, rewriteMap);
           chunkDoc.normalizeDocument();
           logger.info("Writing {0}", tmp);
           job.getStore().writeDocument(chunkDoc, tmp);
@@ -545,9 +547,12 @@ public class ChunkModule extends AbstractPipelineModuleImpl {
 
   /**
    * Based on topic moves in chunk, rewrite link in a topic.
+   *
+   * @param src the source URI used as base for resolving relative hrefs. Must not be {@code null}.
+   *            For submap-root COMBINE chunks with no {@code href}, pass the chunk {@code dst} URI.
    */
   private void rewriteLinks(final Document doc, final URI src, final Map<URI, URI> rewriteMap) {
-    //    Objects.requireNonNull(src);
+    Objects.requireNonNull(src);
     final List<Element> elements = toList(doc.getDocumentElement().getElementsByTagName("*"));
     for (Element link : elements) {
       if (TOPIC_LINK.matches(link) || TOPIC_XREF.matches(link)) {
@@ -618,9 +623,20 @@ public class ChunkModule extends AbstractPipelineModuleImpl {
       // init dst
       URI dstBase;
       if (rootChunk.src() == null) {
+        // src is null for submap-root elements with chunk="to-content" but no href.
+        // Pick a unique generated name by comparing against already-reserved absolute URIs.
+        // rewriteMap values may be relative, so resolve them against mapFile for comparison.
+        // Fix for https://github.com/dita-ot/dita-ot/issues/4802
+        final Set<URI> reservedAbs = rewriteMap
+          .values()
+          .stream()
+          .map(d -> mapFile.resolve(removeFragment(d)))
+          .collect(java.util.stream.Collectors.toSet());
         for (int i = 1;; i++) {
           final URI res = mapFile.resolve(GEN_CHUNK_PREFIX + i + FILE_EXTENSION_DITA);
-          if (rewriteMap.values().stream().anyMatch(d -> removeFragment(d).equals(res))) {
+          // Also check the store so that names already written by a prior execute()
+          // invocation (e.g. a sibling submap processed earlier) are not reused.
+          if (reservedAbs.contains(res) || normalTopicRefs.contains(res) || job.getStore().exists(res)) {
             continue;
           } else {
             dstBase = res;
@@ -634,23 +650,32 @@ public class ChunkModule extends AbstractPipelineModuleImpl {
       }
       dst = setFragment(dst, id);
 
-      // guarantee unique dst
-      final Collection<URI> values = rewriteMap.values();
-      for (int i = 1; values.contains(dst) || normalTopicRefs.contains(removeFragment(dst)); i++) {
-        //                if (rootChunk.src == null) {
-        ////                    id = GEN_CHUNK_PREFIX + i;
-        ////                } else {
-        ////                    assert false;
-        ////                    dstBase = rootChunk.src;
-        //                }
-        dst = addSuffix(dstBase, Integer.toString(i));
-        dst = setFragment(dst, id);
+      // guarantee unique dst — use absolute comparison to match how dstBase was computed
+      {
+        boolean collision;
+        int i = 1;
+        do {
+          final URI candidate = dst;
+          final URI candidateAbs = mapFile.resolve(removeFragment(candidate));
+          collision =
+            rewriteMap.values().stream().anyMatch(d -> mapFile.resolve(removeFragment(d)).equals(candidateAbs)) ||
+            normalTopicRefs.contains(removeFragment(candidate)) ||
+            job.getStore().exists(candidateAbs);
+          if (collision) {
+            dst = setFragment(addSuffix(dstBase, Integer.toString(i++)), id);
+          }
+        } while (collision);
       }
     }
 
-    rewriteMap.put(rootChunk.src(), dst);
     if (rootChunk.src() != null) {
+      rewriteMap.put(rootChunk.src(), dst);
       rewriteMap.put(setFragment(rootChunk.src(), id), dst);
+    } else {
+      // src=null chunks have no stable key, but we must record the assigned dst so
+      // that subsequent src=null chunks in the same invocation see it in reservedAbs
+      // and do not pick the same generated name.
+      rewriteMap.put(removeFragment(dst), dst);
     }
 
     final ChunkBuilder builder = ChunkOperation
